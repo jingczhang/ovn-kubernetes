@@ -36,6 +36,8 @@ import (
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/config"
 	controllerutil "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/controller"
 	eiptypes "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/crd/egressip/v1"
+	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/kubevirt"
+	kubevirtv1 "kubevirt.io/api/core/v1"
 	egressiplisters "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/crd/egressip/v1/apis/listers/egressip/v1"
 	ratypes "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/crd/routeadvertisements/v1"
 	raapply "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/crd/routeadvertisements/v1/apis/applyconfiguration/routeadvertisements/v1"
@@ -72,6 +74,7 @@ type Controller struct {
 	frrLister       frrlisters.FRRConfigurationLister
 	nadLister       nadlisters.NetworkAttachmentDefinitionLister
 	nodeLister      corelisters.NodeLister
+	podLister       corelisters.PodLister
 	raLister        ralisters.RouteAdvertisementsLister
 	namespaceLister corelisters.NamespaceLister
 	vtepLister      vteplisters.VTEPLister
@@ -84,6 +87,7 @@ type Controller struct {
 	frrController  controllerutil.Controller
 	nadController  controllerutil.Controller
 	nodeController controllerutil.Controller
+	podController  controllerutil.Controller
 	raController   controllerutil.Controller
 	nsController   controllerutil.Controller
 
@@ -102,6 +106,7 @@ func NewController(
 		frrLister:       wf.FRRConfigurationsInformer().Lister(),
 		nadLister:       wf.NADInformer().Lister(),
 		nodeLister:      wf.NodeCoreInformer().Lister(),
+		podLister:       wf.PodCoreInformer().Lister(),
 		raLister:        wf.RouteAdvertisementsInformer().Lister(),
 		namespaceLister: wf.NamespaceInformer().Lister(),
 		frrClient:       ovnClient.FRRClient,
@@ -187,6 +192,16 @@ func NewController(
 	}
 	c.nsController = controllerutil.NewController("clustermanager routeadvertisements namespace controller", nsConfig)
 
+	podConfig := &controllerutil.ControllerConfig[corev1.Pod]{
+		RateLimiter:    workqueue.DefaultTypedControllerRateLimiter[string](),
+		Reconcile:      c.reconcileVMPodIPs,
+		Threadiness:    1,
+		Informer:       wf.PodCoreInformer().Informer(),
+		Lister:         wf.PodCoreInformer().Lister().List,
+		ObjNeedsUpdate: vmPodNeedsUpdate,
+	}
+	c.podController = controllerutil.NewController("clustermanager routeadvertisements pod controller", podConfig)
+
 	if util.IsEVPNEnabled() {
 		c.vtepLister = wf.VTEPInformer().Lister()
 	}
@@ -202,6 +217,7 @@ func (c *Controller) Start() error {
 		c.nadController,
 		c.nodeController,
 		c.nsController,
+		c.podController,
 		c.raController,
 	)
 }
@@ -213,6 +229,7 @@ func (c *Controller) Stop() {
 		c.nadController,
 		c.nodeController,
 		c.nsController,
+		c.podController,
 		c.raController,
 	)
 	klog.Infof("Cluster manager routeadvertisements stopped")
@@ -352,6 +369,9 @@ type selectedNetworks struct {
 	ipVRFConfigs []*ipVRFConfig
 	// networkTransport is a map of selected network to their transport mode
 	networkTransport map[string]string
+	// vmPodIPsByNodeByNetwork maps node name to network name to ordered list of VM pod IPs as /32 or /128 prefixes.
+	// Used for VMPodIP advertisement type to advertise individual VM IPs for direct routing.
+	vmPodIPsByNodeByNetwork map[string]map[string][]string
 }
 
 // vrfConfig holds base VRF EVPN configuration for a network
@@ -385,6 +405,12 @@ func (c *Controller) generateFRRConfigurations(ra *ratypes.RouteAdvertisements) 
 	advertisements := sets.New(ra.Spec.Advertisements...)
 	if advertisements.Has(ratypes.EgressIP) && ra.Spec.TargetVRF == "auto" {
 		return nil, nil, fmt.Errorf("%w: advertising EgressIP not supported with TargetVRF set to 'auto'", errConfig)
+	}
+	if advertisements.Has(ratypes.VMPodIP) && advertisements.Has(ratypes.PodNetwork) {
+		return nil, nil, fmt.Errorf("%w: VMPodIP and PodNetwork advertisements are mutually exclusive; use VMPodIP to advertise individual VM IPs or PodNetwork to advertise network subnets", errConfig)
+	}
+	if advertisements.Has(ratypes.VMPodIP) && advertisements.Has(ratypes.EgressIP) {
+		return nil, nil, fmt.Errorf("%w: VMPodIP and EgressIP advertisements are mutually exclusive; VMPodIP requires Layer2 topology while EgressIP requires Layer3 topology", errConfig)
 	}
 
 	// if we are matching on the well known default network label, create an
@@ -426,6 +452,10 @@ func (c *Controller) generateFRRConfigurations(ra *ratypes.RouteAdvertisements) 
 
 		if advertisements.Has(ratypes.EgressIP) && network.TopologyType() == types.Layer2Topology {
 			return nil, nil, fmt.Errorf("%w: EgressIP advertisement is currently not supported for Layer2 networks, network: %s", errConfig, network.GetNetworkName())
+		}
+
+		if advertisements.Has(ratypes.VMPodIP) && network.TopologyType() != types.Layer2Topology {
+			return nil, nil, fmt.Errorf("%w: VMPodIP advertisement is only supported for Layer2 networks, network: %s has topology %s", errConfig, network.GetNetworkName(), network.TopologyType())
 		}
 
 		vrf := util.GetNetworkVRFName(network)
@@ -662,8 +692,17 @@ func (c *Controller) generateFRRConfigurations(ra *ratypes.RouteAdvertisements) 
 		return eipsByNodesByNetworks[nodeName], nil
 	}
 
+	// gather VM pod IPs if VMPodIP advertisement is enabled
+	if advertisements.Has(ratypes.VMPodIP) {
+		selectedNetworks.vmPodIPsByNodeByNetwork, err = c.getVMPodIPsByNodeByNetwork(networkSet)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+
 	// helper to gather the following prefixes:
 	//  - EgressIPs
+	//  - VM pod IPs (for VMPodIP advertisement)
 	//  - host subnets for networks with networkTopology layer3
 	//  - network subnets for networks with networkTopology layer2
 	getPrefixes := func(nodeName, network, networkTopology string, networkSubnets []string) ([]string, error) {
@@ -693,9 +732,20 @@ func (c *Controller) generateFRRConfigurations(ra *ratypes.RouteAdvertisements) 
 			eips = eipsByNode[network].UnsortedList()
 		}
 
-		prefixes := make([]string, 0, len(subnets)+len(eips))
+		// gather VM pod IPs
+		var vmPodIPs []string
+		if advertisements.Has(ratypes.VMPodIP) {
+			if selectedNetworks.vmPodIPsByNodeByNetwork != nil {
+				if nodeNetworks, ok := selectedNetworks.vmPodIPsByNodeByNetwork[nodeName]; ok {
+					vmPodIPs = nodeNetworks[network]
+				}
+			}
+		}
+
+		prefixes := make([]string, 0, len(subnets)+len(eips)+len(vmPodIPs))
 		prefixes = append(prefixes, subnets...)
 		prefixes = append(prefixes, eips...)
+		prefixes = append(prefixes, vmPodIPs...)
 		return prefixes, nil
 	}
 
@@ -1496,6 +1546,130 @@ func (c *Controller) getEgressIPsByNodesByNetworks(networks sets.Set[string]) (m
 	return eipsByNodesByNetworks, nil
 }
 
+// getVMPodIPsByNodeByNetwork iterates pods owned by KubeVirt VirtualMachines
+// that are running on selected networks and returns a "node -> network -> vmPodIPs"
+// map where each VM pod IP is formatted as /32 (IPv4) or /128 (IPv6).
+// For UDN networks, pod IPs are retrieved from the k8s.ovn.org/pod-networks annotation
+// which contains the IPs for each network the pod is attached to.
+// Uses a label selector to list only VM pods (vm.kubevirt.io/name label exists).
+func (c *Controller) getVMPodIPsByNodeByNetwork(networks sets.Set[string]) (map[string]map[string][]string, error) {
+	vmPodIPsByNodeByNetwork := map[string]map[string][]string{}
+
+	// Use label selector to list only pods with the KubeVirt VM label
+	// This is more efficient than listing all pods and filtering
+	pods, err := c.wf.GetAllPodsBySelector(metav1.LabelSelector{
+		MatchExpressions: []metav1.LabelSelectorRequirement{{
+			Key:      kubevirtv1.VirtualMachineNameLabel,
+			Operator: metav1.LabelSelectorOpExists,
+		}},
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	for _, pod := range pods {
+		// Skip pods not owned by a VirtualMachine (extra safety check)
+		if !kubevirt.IsPodOwnedByVirtualMachine(pod) {
+			continue
+		}
+
+		// Skip pods that are not running
+		if pod.Status.Phase != corev1.PodRunning {
+			continue
+		}
+
+		// Skip pods without a node assignment
+		nodeName := pod.Spec.NodeName
+		if nodeName == "" {
+			continue
+		}
+
+		// Get all networks this pod is attached to from the k8s.v1.cni.cncf.io/networks annotation
+		allPodNetworks, err := util.GetK8sPodAllNetworkSelections(pod)
+		if err != nil {
+			klog.V(5).Infof("Failed to get network selections for pod %s/%s: %v", pod.Namespace, pod.Name, err)
+			continue
+		}
+
+		// For each network the pod is attached to, check if it's in our selected networks
+		for _, podNetSel := range allPodNetworks {
+			// Determine the NAD namespace (defaults to pod namespace if not specified)
+			nadNamespace := podNetSel.Namespace
+			if nadNamespace == "" {
+				nadNamespace = pod.Namespace
+			}
+			nadKey := util.GetNADName(nadNamespace, podNetSel.Name)
+
+			// Get the NAD to find the actual network name
+			nad, err := c.nadLister.NetworkAttachmentDefinitions(nadNamespace).Get(podNetSel.Name)
+			if err != nil {
+				klog.V(5).Infof("Failed to get NAD %s for pod %s/%s: %v", nadKey, pod.Namespace, pod.Name, err)
+				continue
+			}
+			networkName := util.GetAnnotatedNetworkName(nad)
+
+			// Check if this network is selected by the RouteAdvertisements
+			if !networks.Has(networkName) {
+				continue
+			}
+
+			// Get pod IPs from the k8s.ovn.org/pod-networks annotation for this NAD
+			podAnnotation, err := util.UnmarshalPodAnnotation(pod.Annotations, nadKey)
+			if err != nil {
+				klog.V(5).Infof("Failed to get pod annotation for NAD %s, pod %s/%s: %v", nadKey, pod.Namespace, pod.Name, err)
+				continue
+			}
+
+			// Get all IPs from the annotation (supports dual-stack)
+			for _, ipNet := range podAnnotation.IPs {
+				ip := ipNet.IP.String() + util.GetIPFullMaskString(ipNet.IP.String())
+
+				if vmPodIPsByNodeByNetwork[nodeName] == nil {
+					vmPodIPsByNodeByNetwork[nodeName] = map[string][]string{}
+				}
+				vmPodIPsByNodeByNetwork[nodeName][networkName] = append(
+					vmPodIPsByNodeByNetwork[nodeName][networkName], ip)
+			}
+		}
+
+		// Also check the primary network for the namespace
+		// This handles pods that are on a UDN primary network
+		primaryNetwork := c.nm.GetActiveNetworkForNamespaceFast(pod.Namespace)
+		if primaryNetwork != nil && networks.Has(primaryNetwork.GetNetworkName()) {
+			networkName := primaryNetwork.GetNetworkName()
+			nadKeys := c.nm.GetNADKeysForNetwork(networkName)
+			for _, nadKey := range nadKeys {
+				podAnnotation, err := util.UnmarshalPodAnnotation(pod.Annotations, nadKey)
+				if err != nil {
+					continue
+				}
+				for _, ipNet := range podAnnotation.IPs {
+					ip := ipNet.IP.String() + util.GetIPFullMaskString(ipNet.IP.String())
+
+					if vmPodIPsByNodeByNetwork[nodeName] == nil {
+						vmPodIPsByNodeByNetwork[nodeName] = map[string][]string{}
+					}
+					vmPodIPsByNodeByNetwork[nodeName][networkName] = append(
+						vmPodIPsByNodeByNetwork[nodeName][networkName], ip)
+				}
+				if len(vmPodIPsByNodeByNetwork[nodeName][networkName]) > 0 {
+					break
+				}
+			}
+		}
+	}
+
+	// Sort and deduplicate the IPs for consistent ordering
+	for nodeName := range vmPodIPsByNodeByNetwork {
+		for network := range vmPodIPsByNodeByNetwork[nodeName] {
+			vmPodIPsByNodeByNetwork[nodeName][network] = sets.List(
+				sets.New(vmPodIPsByNodeByNetwork[nodeName][network]...))
+		}
+	}
+
+	return vmPodIPsByNodeByNetwork, nil
+}
+
 // isOwnUpdate checks if an object was updated by us last, as indicated by its
 // managed fields. Used to avoid reconciling an update that we made ourselves.
 func isOwnUpdate(managedFields []metav1.ManagedFieldsEntry) bool {
@@ -1569,6 +1743,43 @@ func nsNeedsUpdate(oldObj, newObj *corev1.Namespace) bool {
 	return oldObj != nil && newObj != nil && !reflect.DeepEqual(oldObj.Labels, newObj.Labels)
 }
 
+// vmPodNeedsUpdate returns true if a pod event is relevant for VMPodIP advertisement.
+// We only care about pods owned by VirtualMachines that have changed their node assignment,
+// IP addresses (in annotations for UDN), or running status.
+func vmPodNeedsUpdate(oldObj, newObj *corev1.Pod) bool {
+	// Check if either pod is VM-owned
+	oldIsVM := oldObj != nil && kubevirt.IsPodOwnedByVirtualMachine(oldObj)
+	newIsVM := newObj != nil && kubevirt.IsPodOwnedByVirtualMachine(newObj)
+
+	// Ignore pods that are not VM-owned
+	if !oldIsVM && !newIsVM {
+		return false
+	}
+
+	// Pod created or deleted
+	if oldObj == nil || newObj == nil {
+		return true
+	}
+
+	// Node assignment changed (live migration)
+	if oldObj.Spec.NodeName != newObj.Spec.NodeName {
+		return true
+	}
+
+	// Phase changed (e.g., became Running or stopped)
+	if oldObj.Status.Phase != newObj.Status.Phase {
+		return true
+	}
+
+	// Check if pod network annotation changed (for UDN IPs)
+	// The k8s.ovn.org/pod-networks annotation contains the IPs for each network
+	if oldObj.Annotations[util.OvnPodAnnotationName] != newObj.Annotations[util.OvnPodAnnotationName] {
+		return true
+	}
+
+	return false
+}
+
 func (c *Controller) reconcileFRRConfiguration(key string) error {
 	namespace, name, err := cache.SplitMetaNamespaceKey(key)
 	if err != nil {
@@ -1640,6 +1851,23 @@ func (c *Controller) reconcileEgressIPs(string) error {
 
 	for _, ra := range ras {
 		if sets.New(ra.Spec.Advertisements...).Has(ratypes.EgressIP) {
+			c.raController.Reconcile(ra.Name)
+		}
+	}
+
+	return nil
+}
+
+// reconcileVMPodIPs reconciles RouteAdvertisements that advertise VMPodIP
+// when a VM pod is created, deleted, or its node/IP changes.
+func (c *Controller) reconcileVMPodIPs(string) error {
+	ras, err := c.raLister.List(labels.Everything())
+	if err != nil {
+		return err
+	}
+
+	for _, ra := range ras {
+		if sets.New(ra.Spec.Advertisements...).Has(ratypes.VMPodIP) {
 			c.raController.Reconcile(ra.Name)
 		}
 	}

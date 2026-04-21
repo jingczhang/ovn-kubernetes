@@ -30,6 +30,7 @@ type RouteAdvertisements struct {
 // RouteAdvertisementsSpec defines the desired state of RouteAdvertisements
 // +kubebuilder:validation:XValidation:rule="(!has(self.nodeSelector.matchLabels) && !has(self.nodeSelector.matchExpressions)) || !('PodNetwork' in self.advertisements)",message="If 'PodNetwork' is selected for advertisement, a 'nodeSelector' can't be specified as it needs to be advertised on all nodes"
 // +kubebuilder:validation:XValidation:rule="!self.networkSelectors.exists(i, i.networkSelectionType != 'DefaultNetwork' && i.networkSelectionType != 'ClusterUserDefinedNetworks')",message="Only DefaultNetwork or ClusterUserDefinedNetworks can be selected"
+// +kubebuilder:validation:XValidation:rule="!('VMPodIP' in self.advertisements) || self.networkSelectors.all(i, i.networkSelectionType == 'ClusterUserDefinedNetworks')",message="VMPodIP advertisement is only supported for ClusterUserDefinedNetworks"
 type RouteAdvertisementsSpec struct {
 	// targetVRF determines which VRF the routes should be advertised in.
 	// +kubebuilder:validation:Optional
@@ -54,13 +55,13 @@ type RouteAdvertisementsSpec struct {
 	// advertisements determines what is advertised.
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:MinItems=1
-	// +kubebuilder:validation:MaxItems=2
+	// +kubebuilder:validation:MaxItems=3
 	// +kubebuilder:validation:XValidation:rule="self.all(x, self.exists_one(y, x == y))"
 	Advertisements []AdvertisementType `json:"advertisements,omitempty"`
 }
 
 // AdvertisementType determines the type of advertisement.
-// +kubebuilder:validation:Enum=PodNetwork;EgressIP
+// +kubebuilder:validation:Enum=PodNetwork;EgressIP;VMPodIP
 type AdvertisementType string
 
 const (
@@ -69,6 +70,33 @@ const (
 
 	// EgressIP determines that egress IPs are being advertised.
 	EgressIP AdvertisementType = "EgressIP"
+
+	// VMPodIP determines that individual VM pod IPs are advertised as /32 (IPv4) or /128 (IPv6) routes.
+	// This is useful for environments like AWS where VPC route tables don't support ECMP,
+	// allowing each VM to have its own next-hop for direct routing.
+	// VMPodIP only supports Layer2 topology ClusterUserDefinedNetworks with KubeVirt VMs.
+	// Dual-stack is supported - both IPv4 and IPv6 addresses will be advertised.
+	//
+	// Example RouteAdvertisements:
+	//
+	//   apiVersion: k8s.ovn.org/v1
+	//   kind: RouteAdvertisements
+	//   metadata:
+	//     name: advertise-vm-ips
+	//   spec:
+	//     nodeSelector: {}
+	//     frrConfigurationSelector:
+	//       matchLabels:
+	//         app: frr
+	//     networkSelectors:
+	//       - networkSelectionType: ClusterUserDefinedNetworks
+	//         clusterUserDefinedNetworkSelector:
+	//           networkSelector:
+	//             matchLabels:
+	//               advertise: "true"
+	//     advertisements:
+	//       - VMPodIP
+	VMPodIP AdvertisementType = "VMPodIP"
 )
 
 const (
