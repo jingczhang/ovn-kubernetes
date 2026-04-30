@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
-	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -648,20 +647,11 @@ func generateEIPConfig(link netlink.Link, eIP net.IP, isEIPV6 bool) (*eIPConfig,
 }
 
 func generateRoutesForLink(link netlink.Link, isV6 bool) ([]netlink.Route, error) {
-	routeTable := 254 // main table number
-	// check if device is a slave to a VRF device and if so, use VRF devices associated routing table to lookup routes instead of main table
+	// check if device is a slave to a VRF device and if so, use VRF route table directly
 	if isVRFSlaveDevice(link) {
-		vrfLink, err := util.GetNetLinkOps().LinkByIndex(link.Attrs().MasterIndex)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get VRF link from interface index %d: %w", link.Attrs().MasterIndex, err)
-		}
-		vrf, ok := vrfLink.(*netlink.Vrf)
-		if !ok {
-			actualType := reflect.TypeOf(vrfLink)
-			return nil, fmt.Errorf("expected link %s to be type VRF, instead received type %s", vrfLink.Attrs().Name, actualType)
-		}
-		routeTable = int(vrf.Table)
+		return nil, nil
 	}
+	routeTable := 254 // main table number
 	filterRoute, filterMask := filterRouteByLinkTable(link.Attrs().Index, routeTable)
 	linkRoutes, err := util.GetNetLinkOps().RouteListFiltered(util.GetIPFamily(isV6), filterRoute, filterMask)
 	if err != nil {
@@ -1506,11 +1496,17 @@ func isLinkUp(flags string) bool {
 	return strings.Contains(flags, "up")
 }
 
-// generateIPRules generates IP rules at a predefined priority for each pod IP with a custom routing table based
-// from the links 'ifindex'
 func generateIPRule(srcIP net.IP, isIPv6 bool, ifIndex int) netlink.Rule {
 	r := *netlink.NewRule()
 	r.Table = util.CalculateRouteTableID(ifIndex)
+	// check if device is a slave to a VRF device and if so, use VRF route table directly
+	if link, err := util.GetNetLinkOps().LinkByIndex(ifIndex); err == nil && isVRFSlaveDevice(link) {
+		if vrfLink, err := util.GetNetLinkOps().LinkByIndex(link.Attrs().MasterIndex); err == nil {
+			if vrf, ok := vrfLink.(*netlink.Vrf); ok {
+				r.Table = int(vrf.Table)
+			}
+		}
+	}
 	r.Priority = rulePriority
 	var ipFullMask string
 	if isIPv6 {
